@@ -102,8 +102,6 @@ namespace RtmpSharp.IO
 
 
 
-
-
         # region Helper methods
         public long Length { get { return underlying.BaseStream.Length; } }
         public long Position { get { return underlying.BaseStream.Position; } }
@@ -276,8 +274,15 @@ namespace RtmpSharp.IO
                     foreach (var pair in pairs)
                     {
                         IMemberWrapper wrapper;
+
+                        //Fix for subscribing
+                        var tempValue = pair.Value;
+                        if (pair.Key == "operation")
+                            if (pair.Value.GetType() == typeof(double))
+                                tempValue = Convert.ToInt32(pair.Value);
+
                         if (classDescription.TryGetMember(pair.Key, out wrapper))
-                            wrapper.SetValue(instance, pair.Value);
+                            wrapper.SetValue(instance, tempValue);
                     }
                     return instance;
 
@@ -649,7 +654,7 @@ namespace RtmpSharp.IO
                 {
                     while (true)
                     {
-                        var key = ReadUtf();
+                        var key = ReadAmf3String();
                         if (string.IsNullOrEmpty(key))
                             break;
                         var obj = ReadAmf3Item();

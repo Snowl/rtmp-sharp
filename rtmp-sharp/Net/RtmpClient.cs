@@ -5,9 +5,7 @@ using RtmpSharp.Messaging;
 using RtmpSharp.Messaging.Events;
 using RtmpSharp.Messaging.Messages;
 using System;
-using System.Collections.Generic;
 using System.IO;
-using System.Linq;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
@@ -21,10 +19,12 @@ namespace RtmpSharp.Net
     {
         public event EventHandler Disconnected;
         public event EventHandler<MessageReceivedEventArgs> MessageReceived;
+        internal event EventHandler<RemotingMessageReceivedEventArgs> ServerMessageReceived;
+        internal event EventHandler<CommandMessageReceivedEventArgs> ServerCommandReceived;
         public event EventHandler<Exception> CallbackException;
 
         public bool IsDisconnected { get { return !hasConnected || disconnectsFired != 0; } }
-
+        
         public string ClientId;
 
         public bool NoDelay = true;
@@ -46,6 +46,7 @@ namespace RtmpSharp.Net
 
         int invokeId;
         bool hasConnected;
+        bool throwDisconnect;
 
         volatile int disconnectsFired;
 
@@ -76,7 +77,12 @@ namespace RtmpSharp.Net
             this.certificateValidator = certificateValidator;
         }
 
-
+        public RtmpClient(Uri uri, SerializationContext serializationContext, Stream connectedStream) : this(uri, serializationContext, ObjectEncoding.Amf3)
+        {
+            EstablishThreads(connectedStream);
+            hasConnected = true;
+            throwDisconnect = false;
+        }
 
 
 
@@ -85,8 +91,10 @@ namespace RtmpSharp.Net
 
         void OnDisconnected(ExceptionalEventArgs e)
         {
+            #pragma warning disable 420
             if (Interlocked.Increment(ref disconnectsFired) > 1)
                 return;
+            #pragma warning restore 420
 
             if (writer != null) writer.Continue = false;
             if (reader != null) reader.Continue = false;
@@ -100,8 +108,11 @@ namespace RtmpSharp.Net
                     Disconnected(this, e);
             });
 
-            WrapCallback(() => callbackManager.SetExceptionForAll(
-                new ClientDisconnectedException(e.Description, e.Exception)));
+            if (throwDisconnect)
+            {
+                WrapCallback(() => callbackManager.SetExceptionForAll(
+                    new ClientDisconnectedException(e.Description, e.Exception)));
+            }
         }
 
         Task<object> QueueCommandAsTask(Command command, int streamId, int messageStreamId, bool requireConnected = true)
@@ -114,7 +125,7 @@ namespace RtmpSharp.Net
             return task;
         }
 
-        public async Task ConnectAsync()
+        public virtual async Task ConnectAsync()
         {
             if (hasConnected)
                 return;
@@ -134,30 +145,48 @@ namespace RtmpSharp.Net
             random.NextBytes(randomBytes);
 
             // write c0+c1
-            var c01 = new Handshake()
+            var c01 = new RtmpHandshake()
             {
                 Version = 3,
                 Time = (uint)Environment.TickCount,
                 Time2 = 0,
                 Random = randomBytes
             };
-            await Handshake.WriteAsync(stream, c01, true);
+            await RtmpHandshake.WriteAsync(stream, c01, true);
 
             // read s0+s1
-            var s01 = await Handshake.ReadAsync(stream, true);
+            var s01 = await RtmpHandshake.ReadAsync(stream, true);
 
             // write c2
             var c2 = s01.Clone();
             c2.Time2 = (uint)Environment.TickCount;
-            await Handshake.WriteAsync(stream, c2, false);
+            await RtmpHandshake.WriteAsync(stream, c2, false);
 
             // read s2
-            var s2 = await Handshake.ReadAsync(stream, false);
+            var s2 = await RtmpHandshake.ReadAsync(stream, false);
 
-            // handshake check
+            // handshake check. won't work if running a local server (time will be the same) so run on debug
+            #if !DEBUG
             if (!c01.Random.SequenceEqual(s2.Random) || c01.Time != s2.Time)
                 throw new ProtocolViolationException();
-            
+            #endif
+
+            EstablishThreads(stream);
+
+            // call `connect`
+            var connectResult = await ConnectInvokeAsync(null, null, uri.ToString());
+            object cId;
+
+            if (connectResult.TryGetValue("clientId", out cId))
+                ClientId = cId as string;
+            if (connectResult.TryGetValue("id", out cId))
+                ClientId = cId as string;
+
+            hasConnected = true;
+        }
+
+        public void EstablishThreads(Stream stream)
+        {
             writer = new RtmpPacketWriter(new AmfWriter(stream, serializationContext), ObjectEncoding.Amf3);
             reader = new RtmpPacketReader(new AmfReader(stream, serializationContext));
             reader.EventReceived += EventReceivedCallback;
@@ -169,14 +198,6 @@ namespace RtmpSharp.Net
 
             writerThread.Start();
             readerThread.Start();
-
-            // call `connect`
-            var connectResult = await ConnectInvokeAsync(null, null, uri.ToString());
-            object cId;
-            if (connectResult.TryGetValue("clientId", out cId))
-                ClientId = cId as string;
-
-            hasConnected = true;
         }
 
         public void Close()
@@ -212,7 +233,7 @@ namespace RtmpSharp.Net
             OnDisconnected(args);
         }
 
-        void EventReceivedCallback(object sender, EventReceivedEventArgs e)
+        async void EventReceivedCallback(object sender, EventReceivedEventArgs e)
         {
             switch (e.Event.MessageType)
             {
@@ -239,7 +260,7 @@ namespace RtmpSharp.Net
                     if (call.Name == "_result")
                     {
                         // unwrap Flex class, if present
-                        var ack = param as AcknowledgeMessage;
+                        var ack = param as AcknowledgeMessageExt;
                         callbackManager.SetResult(command.InvokeId, ack != null ? ack.Body : param);
                     }
                     else if (call.Name == "_error")
@@ -250,7 +271,7 @@ namespace RtmpSharp.Net
                     }
                     else if (call.Name == "receive")
                     {
-                        var message = param as AsyncMessage;
+                        var message = param as AsyncMessageExt;
                         if (message == null)
                             break;
 
@@ -270,6 +291,40 @@ namespace RtmpSharp.Net
                     else if (call.Name == "onstatus")
                     {
                         System.Diagnostics.Debug.Print("Received status.");
+                    }
+                    else if (call.Name == "connect")
+                    {
+                        await ConnectResultInvokeAsync(call.Parameters);
+                    }
+                    else if (param is RemotingMessage)
+                    {
+                        var message = param as RemotingMessage;
+
+                        object endpoint;
+                        message.Headers.TryGetValue(AsyncMessageHeaders.Endpoint, out endpoint);
+                        object id;
+                        message.Headers.TryGetValue(AsyncMessageHeaders.ID, out id);
+
+                        WrapCallback(() =>
+                        {
+                            if (ServerMessageReceived != null)
+                                ServerMessageReceived(this, new RemotingMessageReceivedEventArgs(message, message.Operation, endpoint as string, message.Destination, message.MessageId, message.Body,command.InvokeId));
+                        });
+                    }
+                    else if (param is CommandMessage)
+                    {
+                        var message = param as CommandMessage;
+
+                        object endpoint;
+                        message.Headers.TryGetValue(AsyncMessageHeaders.Endpoint, out endpoint);
+                        object id;
+                        message.Headers.TryGetValue(AsyncMessageHeaders.ID, out id);
+
+                        WrapCallback(() =>
+                        {
+                            if (ServerCommandReceived != null)
+                                ServerCommandReceived(this, new CommandMessageReceivedEventArgs(message, endpoint as string, id as string, command.InvokeId));
+                        });
                     }
                     else
                     {
@@ -306,21 +361,34 @@ namespace RtmpSharp.Net
             return InvokeAsync<T>(endpoint, destination, method, new[] { argument });
         }
 
+        internal async Task<T> InvokeAsync<T>(RemotingMessage message)
+        {
+
+            var invoke = new InvokeAmf3()
+            {
+                InvokeId = GetNextInvokeId(),
+                MethodCall = new Method(null, new object[] { message })
+            };
+            var result = await QueueCommandAsTask(invoke, 3, 0);
+            return (T)MiniTypeConverter.ConvertTo(result, typeof(T));
+        }
+
         public async Task<T> InvokeAsync<T>(string endpoint, string destination, string method, object[] arguments)
         {
             if (objectEncoding != ObjectEncoding.Amf3)
                 throw new NotSupportedException("Flex RPC requires AMF3 encoding.");
-
             var remotingMessage = new RemotingMessage
             {
-                ClientId = Guid.NewGuid().ToString("D"),
+                ClientId = ClientId,//Guid.NewGuid().ToString("D"),
                 Destination = destination,
                 Operation = method,
                 Body = arguments,
-                Headers = new Dictionary<string, object>()
+                Headers = new AsObject
                 {
                     { FlexMessageHeaders.Endpoint, endpoint },
-                    { FlexMessageHeaders.FlexClientId, ClientId ?? "nil" }
+                    { FlexMessageHeaders.FlexClientId, ClientId ?? "nil" },
+                    { FlexMessageHeaders.RequestTimeout, 60 }
+
                 }
             };
 
@@ -333,36 +401,137 @@ namespace RtmpSharp.Net
             return (T)MiniTypeConverter.ConvertTo(result, typeof(T));
         }
 
+        internal void InvokeResult(int invokeId, AcknowledgeMessageExt message)
+        {
+            if (objectEncoding != ObjectEncoding.Amf3)
+                throw new NotSupportedException("Flex RPC requires AMF3 encoding.");
 
+            var invoke = new InvokeAmf3()
+            {
+                InvokeId = invokeId,
+                MethodCall = new Method("_result", new object[] { message }, true, CallStatus.Result)
+            };
+            QueueCommandAsTask(invoke, 3, 0);
+        }
 
+        public void InvokeResult(int invokeId, string correlationId, object argument)
+        {
+            var call = new AcknowledgeMessageExt()
+            {
+                ClientId = Uuid.NewUuid(),
+                MessageId = Uuid.NewUuid(),
+                Body = argument,
+                CorrelationId = correlationId,
+            };
 
+            InvokeResult(invokeId, call);
+        }
 
+        public void InvokeReceive(string clientId, string subtopic, object body)
+        {
+            var invoke = new InvokeAmf3()
+            {
+                InvokeId = 0,
+                MethodCall = new Method("receive", new object[] 
+                { 
+                    new AsyncMessageExt
+                    {
+                        Headers = new AsObject { { FlexMessageHeaders.FlexSubtopic, subtopic } },
+                        ClientId = clientId,
+                        Body = body,
+                        MessageId = Uuid.NewUuid()
+                    }
+                })
+            };
+            QueueCommandAsTask(invoke, 3, 0);
+        }
 
+        public void InvokeDestReceive(string clientId, string subtopic, string destination, object body)
+        {
+            var invoke = new InvokeAmf3()
+            {
+                InvokeId = 0,
+                MethodCall = new Method("receive", new object[] 
+                { 
+                    new AsyncMessageExt
+                    {
+                        Headers = new AsObject { { FlexMessageHeaders.FlexSubtopic, subtopic } },
+                        ClientId = clientId,
+                        Destination = destination,
+                        Body = body,
+                        MessageId = Uuid.NewUuid()
+                    }
+                })
+            };
+            QueueCommandAsTask(invoke, 3, 0);
+        }
 
+        public async Task<AsObject> ConnectResultInvokeAsync(object[] parameters)
+        {
+            //Write ServerBW & ClientBW
+            var ServerBW = new WindowAcknowledgementSize(245248000);
+            WriteProtocolControlMessage(ServerBW);
+            var ClientBW = new PeerBandwidth(250000, 2);
+            WriteProtocolControlMessage(ClientBW);
 
+            SetChunkSize(50000);
+            ClientId = Uuid.NewUuid();
+            var connectResult = new InvokeAmf0
+            {
+                MethodCall = new Method("_result", new object[1] {
+                    new AsObject
+                               {
+                                   { "objectEncoding", 3.0                    },
+                                   { "level", "status"                        },
+                                   { "details", null                          },
+                                   { "description", "Connection succeeded."   },
+                                   { "DSMessagingVersion", 1.0                },
+                                   { "code", "NetConnection.Connect.Success"  },
+                                   { "id", Uuid.NewUuid() }
+                               }
+                }),
+                InvokeId = GetNextInvokeId()
+            };
 
+            return (AsObject)await QueueCommandAsTask(connectResult, 3, 0);
+        }
 
         async Task<AsObject> ConnectInvokeAsync(string pageUrl, string swfUrl, string tcUrl)
         {
             var connect = new InvokeAmf0
             {
-                MethodCall = new Method("connect", new object[0]),
-                ConnectionParameters = new AsObject
-                {
-                    { "pageUrl",           pageUrl                },
-                    { "objectEncoding",    (double)objectEncoding },
-                    { "capabilities",      15                     },
-                    { "audioCodecs",       1639                   },
-                    { "flashVer",          "WIN 9,0,115,0"        },
-                    { "swfUrl",            swfUrl                 },
-                    { "videoFunction",     1                      },
-                    { "fpad",              false                  },
-                    { "videoCodecs",       252                    },
-                    { "tcUrl",             tcUrl                  },
-                    { "app",               null                   }
-                },
+                MethodCall = new Method("connect", new object[] {false, "nil", "", new CommandMessage
+                    { 
+                        Operation = CommandOperation.ClientPing,
+                        CorrelationId = "",
+                        MessageId = Uuid.NewUuid(),
+                        Destination = "",
+                        Headers = new AsObject
+                        {
+                            { FlexMessageHeaders.FlexMessagingVersion, 1.0 },
+                            { FlexMessageHeaders.FlexClientId, "my-rtmps" },
+                        }
+                    }
+                }),
+                ConnectionParameters =
+                    new AsObject
+                    {
+                        { "pageUrl",           pageUrl                },
+                        { "objectEncoding",    (double)objectEncoding },
+                        { "capabilities",      239.0                  },
+                        { "audioCodecs",       3575.0                 },
+                        { "flashVer",          "WIN 11,7,700,169"     },
+                        { "swfUrl",            "app:/LolClient.swf/[[DYNAMIC]]/48"},
+                        { "videoFunction",     1.0                    },
+                        { "fpad",              false                  },
+                        { "videoCodecs",       252.0                  },
+                        { "tcUrl",             tcUrl                  },
+                        { "app",               ""                     }
+                    },
                 InvokeId = GetNextInvokeId()
+                
             };
+
             return (AsObject)await QueueCommandAsTask(connect, 3, 0, requireConnected: false);
         }
 
@@ -374,7 +543,7 @@ namespace RtmpSharp.Net
                 CorrelationId = null,
                 Operation = CommandOperation.Subscribe,
                 Destination = destination,
-                Headers = new Dictionary<string, object>()
+                Headers = new AsObject
                 {
                     { FlexMessageHeaders.Endpoint, endpoint },
                     { FlexMessageHeaders.FlexClientId, clientId },
@@ -392,7 +561,7 @@ namespace RtmpSharp.Net
                 CorrelationId = null,
                 Operation = CommandOperation.Unsubscribe,
                 Destination = destination,
-                Headers = new Dictionary<string, object>()
+                Headers = new AsObject
                 {
                     { FlexMessageHeaders.Endpoint, endpoint },
                     { FlexMessageHeaders.FlexClientId, clientId },
@@ -410,6 +579,18 @@ namespace RtmpSharp.Net
                 Destination = string.Empty, // destination must not be null to work on some servers
                 Operation = CommandOperation.Login,
                 Body = Convert.ToBase64String(Encoding.UTF8.GetBytes(string.Format("{0}:{1}", username, password))),
+            };
+            return await InvokeAsync<string>(null, message) == "success";
+        }
+
+        public async Task<bool> LoginAsync(string base64)
+        {
+            var message = new CommandMessage
+            {
+                ClientId = ClientId,
+                Destination = string.Empty, // destination must not be null to work on some servers
+                Operation = CommandOperation.Login,
+                Body = base64,
             };
             return await InvokeAsync<string>(null, message) == "success";
         }
@@ -452,6 +633,7 @@ namespace RtmpSharp.Net
             return Interlocked.Increment(ref invokeId);
         }
 
+        #pragma warning disable 0168 //Disable unused variable warning
         void WrapCallback(Action action)
         {
             try
@@ -481,73 +663,5 @@ namespace RtmpSharp.Net
             source.SetException(exception);
             return source.Task;
         }
-
-
-
-
-        #region Handshake struct
-
-        const int HandshakeRandomSize = 1528;
-
-        // size for c0, c1, s1, s2 packets. c0 and s0 are 1 byte each.
-        const int HandshakeSize = HandshakeRandomSize + 4 + 4;
-
-        struct Handshake
-        {
-            // C0/S0 only
-            public byte Version;
-
-            // C1/S1/C2/S2
-            public uint Time;
-            // in C1/S1, MUST be zero. in C2/S2, time at which C1/S1 was read.
-            public uint Time2;
-            public byte[] Random;
-
-            public Handshake Clone()
-            {
-                return new Handshake()
-                {
-                    Version = Version,
-                    Time = Time,
-                    Time2 = Time2,
-                    Random = Random
-                };
-            }
-
-            public static async Task<Handshake> ReadAsync(Stream stream, bool readVersion)
-            {
-                var size = HandshakeSize + (readVersion ? 1 : 0);
-                var buffer = await StreamHelper.ReadBytesAsync(stream, size);
-
-                using (var reader = new AmfReader(new MemoryStream(buffer), null))
-                {
-                    return new Handshake()
-                    {
-                        Version = readVersion ? reader.ReadByte() : default(byte),
-                        Time = reader.ReadUInt32(),
-                        Time2 = reader.ReadUInt32(),
-                        Random = reader.ReadBytes(HandshakeRandomSize)
-                    };
-                }
-            }
-
-            public static Task WriteAsync(Stream stream, Handshake h, bool writeVersion)
-            {
-                using (var memoryStream = new MemoryStream())
-                using (var writer = new AmfWriter(memoryStream, null))
-                {
-                    if (writeVersion)
-                        writer.WriteByte(h.Version);
-
-                    writer.WriteUInt32(h.Time);
-                    writer.WriteUInt32(h.Time2);
-                    writer.WriteBytes(h.Random);
-
-                    var buffer = memoryStream.ToArray();
-                    return stream.WriteAsync(buffer, 0, buffer.Length);
-                }
-            }
-        }
-        #endregion
     }
 }

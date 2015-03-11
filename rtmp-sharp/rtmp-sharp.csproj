@@ -16,7 +16,7 @@
     <DebugSymbols>true</DebugSymbols>
     <DebugType>full</DebugType>
     <Optimize>false</Optimize>
-    <OutputPath>..\..\gac\</OutputPath>
+    <OutputPath>..\Poro\Poro\bin\Debug\</OutputPath>
     <DefineConstants>DEBUG;TRACE</DefineConstants>
     <ErrorReport>prompt</ErrorReport>
     <WarningLevel>4</WarningLevel>
@@ -25,16 +25,13 @@
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
     <DebugType>pdbonly</DebugType>
     <Optimize>true</Optimize>
-    <OutputPath>..\..\gac\</OutputPath>
+    <OutputPath>..\Poro\Poro\bin\Release\</OutputPath>
     <DefineConstants>TRACE</DefineConstants>
     <ErrorReport>prompt</ErrorReport>
     <WarningLevel>4</WarningLevel>
   </PropertyGroup>
   <PropertyGroup>
-    <SignAssembly>true</SignAssembly>
-  </PropertyGroup>
-  <PropertyGroup>
-    <AssemblyOriginatorKeyFile>..\..\..\keys\wintermint\strong-name-keys\rtmp-sharp.snk</AssemblyOriginatorKeyFile>
+    <SignAssembly>false</SignAssembly>
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="System" />
@@ -46,6 +43,8 @@
     <Reference Include="System.Xml" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="IO\Uuid.cs" />
+    <Compile Include="Messaging\CommandMessageReceivedEventArgs.cs" />
     <Compile Include="Complete\ExceptionalEventArgs.cs" />
     <Compile Include="Complete\IO\StreamHelper.cs" />
     <Compile Include="Complete\IO\Zlib\Adler32.cs" />
@@ -122,7 +121,9 @@
     <Compile Include="Messaging\InvocationException.cs" />
     <Compile Include="Messaging\MessageReceivedEventArgs.cs" />
     <Compile Include="Messaging\Messages\AcknowledgeMessage.cs" />
+    <Compile Include="Messaging\Messages\AcknowledgeMessageExt.cs" />
     <Compile Include="Messaging\Messages\AsyncMessage.cs" />
+    <Compile Include="Messaging\Messages\AsyncMessageExt.cs" />
     <Compile Include="Messaging\Messages\CommandMessage.cs" />
     <Compile Include="Messaging\Messages\ErrorMessage.cs" />
     <Compile Include="Messaging\Messages\FlexMessage.cs" />
@@ -132,19 +133,17 @@
     <Compile Include="Net\ClientDisconnectedException.cs" />
     <Compile Include="Net\EventReceivedEventArgs.cs" />
     <Compile Include="Net\MessageType.cs" />
+    <Compile Include="Messaging\RemotingMessageReceivedEventArgs.cs" />
     <Compile Include="Net\RtmpClient.cs" />
+    <Compile Include="Net\RtmpHandshake.cs" />
     <Compile Include="Net\RtmpHeader.cs" />
     <Compile Include="Net\RtmpPacket.cs" />
     <Compile Include="Net\RtmpPacketReader.cs" />
     <Compile Include="Net\RtmpPacketWriter.cs" />
+    <Compile Include="Net\RtmpServer.cs" />
     <Compile Include="Net\StatusAsObject.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="RtmpSharp.cs" />
-  </ItemGroup>
-  <ItemGroup>
-    <None Include="..\..\..\keys\wintermint\strong-name-keys\rtmp-sharp.snk">
-      <Link>rtmp-sharp.snk</Link>
-    </None>
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <!-- To modify your build process, add your task inside one of the targets below and uncomment it. 
