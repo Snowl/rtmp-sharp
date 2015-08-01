@@ -43,7 +43,7 @@ namespace RtmpSharp.IO
         // Add the type to the list of creatable types
         public void Register(Type type)
         {
-            if (type.IsEnum || constructors.ContainsKey(type))
+            if (type.IsEnum || constructors.ContainsKey(type) || type.IsGenericTypeDefinition)
                 return;
 
             var constructor = type.GetConstructors().FirstOrDefault(x => x.GetParameters().Length == 0);
